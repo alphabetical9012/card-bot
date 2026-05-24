@@ -5,6 +5,7 @@ import logging
 import asyncio
 import threading
 import requests
+import psycopg2
 from flask import Flask
 from telegram import Update
 from telegram.ext import (
@@ -15,11 +16,47 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-CARDS_FILE = "cards.json"
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 PORT = int(os.getenv("PORT", "8080"))
 RENDER_URL = os.getenv("RENDER_URL", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+# --- База данных ---
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+def init_db():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS cards (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    file_id TEXT NOT NULL
+                )
+            """)
+        conn.commit()
+    logger.info("База данных инициализирована")
+
+def load_cards():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, name, file_id FROM cards ORDER BY id")
+            rows = cur.fetchall()
+    return [{"id": r[0], "name": r[1], "file_id": r[2]} for r in rows]
+
+def save_card(name, file_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO cards (name, file_id) VALUES (%s, %s)", (name, file_id))
+        conn.commit()
+
+def clear_cards():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM cards")
+        conn.commit()
 
 # --- Flask ---
 flask_app = Flask(__name__)
@@ -30,26 +67,14 @@ def home():
 
 # --- Автопинг ---
 def keep_alive():
+    import time
     while True:
         try:
             if RENDER_URL:
                 requests.get(RENDER_URL, timeout=10)
-                logger.info("Пинг отправлен")
         except Exception as e:
             logger.warning(f"Пинг не удался: {e}")
-        import time
-        time.sleep(300)  # каждые 5 минут
-
-# --- Карты ---
-def load_cards():
-    if os.path.exists(CARDS_FILE):
-        with open(CARDS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []
-
-def save_cards(cards):
-    with open(CARDS_FILE, "w", encoding="utf-8") as f:
-        json.dump(cards, f, ensure_ascii=False, indent=2)
+        time.sleep(300)
 
 # --- Колода ---
 deck = []
@@ -74,8 +99,7 @@ async def upload_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Только для администратора.")
         return
     context.user_data["uploading"] = True
-    context.user_data["upload_buffer"] = []
-    await update.message.reply_text("📤 Режим загрузки активен.\nОтправляй фото одно за одним.\nКогда закончишь — /done")
+    await update.message.reply_text("📤 Режим загрузки активен.\nОтправляй фото одно за одним с подписью — названием карты.\nКогда закончишь — /done")
 
 async def upload_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -84,18 +108,10 @@ async def upload_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("uploading"):
         await update.message.reply_text("Сначала начни загрузку командой /upload")
         return
-    buffer = context.user_data.get("upload_buffer", [])
-    if not buffer:
-        await update.message.reply_text("Ты не загрузила ни одной карты.")
-        return
-    # Дозагружаем к уже существующим
-    existing = load_cards()
-    existing.extend(buffer)
-    save_cards(existing)
-    shuffle_deck(existing)
     context.user_data["uploading"] = False
-    context.user_data["upload_buffer"] = []
-    await update.message.reply_text(f"✅ Сохранено {len(buffer)} карт. Всего в колоде: {len(existing)}.")
+    cards = load_cards()
+    shuffle_deck(cards)
+    await update.message.reply_text(f"✅ Загрузка завершена. Всего в колоде: {len(cards)} карт.")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -109,10 +125,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["pending_photo"] = file_id
         await update.message.reply_text("📝 Напиши название этой карты следующим сообщением.")
         return
-    buffer = context.user_data.setdefault("upload_buffer", [])
-    card_num = len(load_cards()) + len(buffer) + 1
-    buffer.append({"id": card_num, "name": caption.strip(), "file_id": file_id})
-    await update.message.reply_text(f"✅ Карта {card_num}: «{caption.strip()}» сохранена.")
+    save_card(caption.strip(), file_id)
+    cards = load_cards()
+    await update.message.reply_text(f"✅ Карта {len(cards)}: «{caption.strip()}» сохранена.")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -120,10 +135,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user_id == ADMIN_ID and context.user_data.get("uploading") and context.user_data.get("pending_photo"):
         file_id = context.user_data.pop("pending_photo")
-        buffer = context.user_data.setdefault("upload_buffer", [])
-        card_num = len(load_cards()) + len(buffer) + 1
-        buffer.append({"id": card_num, "name": text, "file_id": file_id})
-        await update.message.reply_text(f"✅ Карта {card_num}: «{text}» сохранена.")
+        save_card(text, file_id)
+        cards = load_cards()
+        await update.message.reply_text(f"✅ Карта {len(cards)}: «{text}» сохранена.")
         return
 
     cards = load_cards()
@@ -158,12 +172,11 @@ async def reset_cards(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Только для администратора.")
         return
-    save_cards([])
+    clear_cards()
     global deck
     deck = []
-    await update.message.reply_text("🗑 Колода очищена. Можно загружать заново командой /upload")
+    await update.message.reply_text("🗑 Колода очищена. Загружай заново командой /upload")
 
-# --- Основная async функция ---
 async def run_bot():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -179,19 +192,16 @@ async def run_bot():
     await app.updater.start_polling()
     await asyncio.Event().wait()
 
-# --- Запуск ---
 def main():
     if not TOKEN:
         logger.error("BOT_TOKEN не задан!")
         return
-
+    init_db()
     threading.Thread(
         target=lambda: flask_app.run(host="0.0.0.0", port=PORT, use_reloader=False),
         daemon=True
     ).start()
-
     threading.Thread(target=keep_alive, daemon=True).start()
-
     logger.info(f"Flask запущен на порту {PORT}")
     asyncio.run(run_bot())
 
