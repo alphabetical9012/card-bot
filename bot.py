@@ -18,19 +18,14 @@ TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 PORT = int(os.getenv("PORT", "8080"))
 
-# --- Flask веб-сервер (чтобы Render не убивал процесс) ---
-
+# --- Flask ---
 flask_app = Flask(__name__)
 
 @flask_app.route("/")
 def home():
     return "Bot is running!", 200
 
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT)
-
-# --- Загрузка/сохранение карт ---
-
+# --- Карты ---
 def load_cards():
     if os.path.exists(CARDS_FILE):
         with open(CARDS_FILE, "r", encoding="utf-8") as f:
@@ -41,8 +36,7 @@ def save_cards(cards):
     with open(CARDS_FILE, "w", encoding="utf-8") as f:
         json.dump(cards, f, ensure_ascii=False, indent=2)
 
-# --- Состояние колоды (в памяти) ---
-
+# --- Колода ---
 deck = []
 
 def shuffle_deck(cards):
@@ -50,23 +44,15 @@ def shuffle_deck(cards):
     indices = list(range(len(cards)))
     random.shuffle(indices)
     deck[:] = indices
-    logger.info(f"Колода перемешана: {deck}")
 
-# --- Команды ---
-
+# --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cards = load_cards()
     if not cards:
-        await update.message.reply_text(
-            "👋 Привет! Колода ещё пуста.\n"
-            "Администратор должен загрузить карты командой /upload"
-        )
+        await update.message.reply_text("👋 Колода пуста. Администратор загружает карты командой /upload")
         return
     shuffle_deck(cards)
-    await update.message.reply_text(
-        f"🃏 Колода готова — {len(cards)} карт.\n"
-        f"Напиши число от 1 до {len(cards)}, чтобы вытащить карту."
-    )
+    await update.message.reply_text(f"🃏 Колода готова — {len(cards)} карт.\nНапиши число от 1 до {len(cards)}, чтобы вытащить карту.")
 
 async def upload_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -74,11 +60,7 @@ async def upload_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data["uploading"] = True
     context.user_data["upload_buffer"] = []
-    await update.message.reply_text(
-        "📤 Режим загрузки активен.\n"
-        "Отправляй фото одно за одним. Каждое фото — отдельное сообщение.\n"
-        "Когда закончишь — /done"
-    )
+    await update.message.reply_text("📤 Режим загрузки активен.\nОтправляй фото одно за одним.\nКогда закончишь — /done")
 
 async def upload_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -92,13 +74,10 @@ async def upload_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ты не загрузила ни одной карты.")
         return
     save_cards(buffer)
-    cards = load_cards()
-    shuffle_deck(cards)
+    shuffle_deck(load_cards())
     context.user_data["uploading"] = False
     context.user_data["upload_buffer"] = []
-    await update.message.reply_text(
-        f"✅ Сохранено {len(buffer)} карт. Колода перемешана и готова к работе."
-    )
+    await update.message.reply_text(f"✅ Сохранено {len(buffer)} карт. Колода готова!")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -131,19 +110,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cards = load_cards()
     if not cards:
-        await update.message.reply_text("Колода пуста. Обратись к администратору.")
+        await update.message.reply_text("Колода пуста.")
         return
     if not deck:
         shuffle_deck(cards)
     if not text.isdigit():
-        await update.message.reply_text(f"Напиши число от 1 до {len(cards)}, чтобы вытащить карту.")
+        await update.message.reply_text(f"Напиши число от 1 до {len(cards)}.")
         return
     n = int(text)
     if n < 1 or n > len(deck):
         await update.message.reply_text(f"Число должно быть от 1 до {len(deck)}.")
         return
-    card_index = deck[n - 1]
-    card = cards[card_index]
+    card = cards[deck[n - 1]]
     await update.message.reply_photo(
         photo=card["file_id"],
         caption=f"🃏 *{card['name']}*",
@@ -156,15 +134,21 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not cards:
         await update.message.reply_text("Колода пуста.")
         return
-    await update.message.reply_text(
-        f"🃏 В колоде {len(cards)} карт.\n"
-        f"Напиши число от 1 до {len(cards)}, чтобы вытащить карту."
-    )
+    await update.message.reply_text(f"🃏 В колоде {len(cards)} карт.\nНапиши число от 1 до {len(cards)}.")
 
 # --- Запуск ---
-
 def main():
-    threading.Thread(target=run_flask, daemon=True).start()
+    if not TOKEN:
+        logger.error("BOT_TOKEN не задан!")
+        return
+
+    # Flask в отдельном потоке
+    t = threading.Thread(target=lambda: flask_app.run(host="0.0.0.0", port=PORT, use_reloader=False))
+    t.daemon = True
+    t.start()
+    logger.info(f"Flask запущен на порту {PORT}")
+
+    # Бот
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("upload", upload_start))
