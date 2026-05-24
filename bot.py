@@ -2,6 +2,7 @@ import os
 import json
 import random
 import logging
+import asyncio
 import threading
 from flask import Flask
 from telegram import Update
@@ -136,19 +137,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(f"🃏 В колоде {len(cards)} карт.\nНапиши число от 1 до {len(cards)}.")
 
-# --- Запуск ---
-def main():
-    if not TOKEN:
-        logger.error("BOT_TOKEN не задан!")
-        return
-
-    # Flask в отдельном потоке
-    t = threading.Thread(target=lambda: flask_app.run(host="0.0.0.0", port=PORT, use_reloader=False))
-    t.daemon = True
-    t.start()
-    logger.info(f"Flask запущен на порту {PORT}")
-
-    # Бот
+# --- Основная async функция ---
+async def run_bot():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("upload", upload_start))
@@ -157,7 +147,28 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     logger.info("Бот запущен")
-    app.run_polling()
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    # держим бота живым
+    await asyncio.Event().wait()
+
+# --- Запуск ---
+def main():
+    if not TOKEN:
+        logger.error("BOT_TOKEN не задан!")
+        return
+
+    # Flask в отдельном потоке
+    t = threading.Thread(
+        target=lambda: flask_app.run(host="0.0.0.0", port=PORT, use_reloader=False),
+        daemon=True
+    )
+    t.start()
+    logger.info(f"Flask запущен на порту {PORT}")
+
+    # Бот в основном потоке через asyncio
+    asyncio.run(run_bot())
 
 if __name__ == "__main__":
     main()
