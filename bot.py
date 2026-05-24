@@ -4,6 +4,7 @@ import random
 import logging
 import asyncio
 import threading
+import requests
 from flask import Flask
 from telegram import Update
 from telegram.ext import (
@@ -18,6 +19,7 @@ CARDS_FILE = "cards.json"
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 PORT = int(os.getenv("PORT", "8080"))
+RENDER_URL = os.getenv("RENDER_URL", "")
 
 # --- Flask ---
 flask_app = Flask(__name__)
@@ -25,6 +27,18 @@ flask_app = Flask(__name__)
 @flask_app.route("/")
 def home():
     return "Bot is running!", 200
+
+# --- Автопинг ---
+def keep_alive():
+    while True:
+        try:
+            if RENDER_URL:
+                requests.get(RENDER_URL, timeout=10)
+                logger.info("Пинг отправлен")
+        except Exception as e:
+            logger.warning(f"Пинг не удался: {e}")
+        import time
+        time.sleep(300)  # каждые 5 минут
 
 # --- Карты ---
 def load_cards():
@@ -74,11 +88,14 @@ async def upload_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not buffer:
         await update.message.reply_text("Ты не загрузила ни одной карты.")
         return
-    save_cards(buffer)
-    shuffle_deck(load_cards())
+    # Дозагружаем к уже существующим
+    existing = load_cards()
+    existing.extend(buffer)
+    save_cards(existing)
+    shuffle_deck(existing)
     context.user_data["uploading"] = False
     context.user_data["upload_buffer"] = []
-    await update.message.reply_text(f"✅ Сохранено {len(buffer)} карт. Колода готова!")
+    await update.message.reply_text(f"✅ Сохранено {len(buffer)} карт. Всего в колоде: {len(existing)}.")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -93,7 +110,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📝 Напиши название этой карты следующим сообщением.")
         return
     buffer = context.user_data.setdefault("upload_buffer", [])
-    card_num = len(buffer) + 1
+    card_num = len(load_cards()) + len(buffer) + 1
     buffer.append({"id": card_num, "name": caption.strip(), "file_id": file_id})
     await update.message.reply_text(f"✅ Карта {card_num}: «{caption.strip()}» сохранена.")
 
@@ -104,7 +121,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id == ADMIN_ID and context.user_data.get("uploading") and context.user_data.get("pending_photo"):
         file_id = context.user_data.pop("pending_photo")
         buffer = context.user_data.setdefault("upload_buffer", [])
-        card_num = len(buffer) + 1
+        card_num = len(load_cards()) + len(buffer) + 1
         buffer.append({"id": card_num, "name": text, "file_id": file_id})
         await update.message.reply_text(f"✅ Карта {card_num}: «{text}» сохранена.")
         return
@@ -137,6 +154,15 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(f"🃏 В колоде {len(cards)} карт.\nНапиши число от 1 до {len(cards)}.")
 
+async def reset_cards(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Только для администратора.")
+        return
+    save_cards([])
+    global deck
+    deck = []
+    await update.message.reply_text("🗑 Колода очищена. Можно загружать заново командой /upload")
+
 # --- Основная async функция ---
 async def run_bot():
     app = ApplicationBuilder().token(TOKEN).build()
@@ -144,13 +170,13 @@ async def run_bot():
     app.add_handler(CommandHandler("upload", upload_start))
     app.add_handler(CommandHandler("done", upload_done))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("reset", reset_cards))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     logger.info("Бот запущен")
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
-    # держим бота живым
     await asyncio.Event().wait()
 
 # --- Запуск ---
@@ -159,15 +185,14 @@ def main():
         logger.error("BOT_TOKEN не задан!")
         return
 
-    # Flask в отдельном потоке
-    t = threading.Thread(
+    threading.Thread(
         target=lambda: flask_app.run(host="0.0.0.0", port=PORT, use_reloader=False),
         daemon=True
-    )
-    t.start()
-    logger.info(f"Flask запущен на порту {PORT}")
+    ).start()
 
-    # Бот в основном потоке через asyncio
+    threading.Thread(target=keep_alive, daemon=True).start()
+
+    logger.info(f"Flask запущен на порту {PORT}")
     asyncio.run(run_bot())
 
 if __name__ == "__main__":
